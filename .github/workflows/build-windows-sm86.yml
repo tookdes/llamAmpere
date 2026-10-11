@@ -1,0 +1,111 @@
+name: Windows SM86 Build
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: windows-sm86-main
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Windows x64 / CUDA 12.4 / SM86
+    runs-on: windows-2022
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Show source revision
+        shell: powershell
+        run: |
+          git describe --tags --always
+          git rev-parse HEAD
+
+      - name: Install CUDA 12.4
+        uses: ./.github/actions/windows-setup-cuda
+        with:
+          cuda_version: '12.4'
+          cuda_arch: x64
+
+      - name: Install Ninja
+        shell: powershell
+        run: choco install ninja -y --no-progress
+
+      - name: Configure and build
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          cmake -S . -B build-sm86 -G "Ninja Multi-Config" ^
+            -DCMAKE_CUDA_ARCHITECTURES=86 ^
+            -DGGML_CUDA=ON ^
+            -DGGML_NATIVE=OFF ^
+            -DGGML_CUDA_CCCL_VERSION=v3.4.3 ^
+            -DLLAMA_BUILD_BORINGSSL=ON ^
+            -DLLAMA_BUILD_SERVER=ON ^
+            -DLLAMA_BUILD_TOOLS=ON ^
+            -DLLAMA_BUILD_TESTS=OFF ^
+            -DLLAMA_BUILD_EXAMPLES=OFF
+          set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
+          if %NINJA_JOBS% LSS 1 set NINJA_JOBS=1
+          cmake --build build-sm86 --config Release -j %NINJA_JOBS% --target llama-server llama-cli
+
+      - name: Verify outputs and bundle runtime
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $dest = Join-Path $PWD "build-sm86\bin\Release"
+
+          foreach ($exe in @("llama-server.exe", "llama-cli.exe")) {
+            if (-not (Test-Path (Join-Path $dest $exe))) {
+              throw "$exe was not produced"
+            }
+          }
+
+          $cudaBin = Join-Path $env:CUDA_PATH "bin"
+          foreach ($pattern in @("cudart64_*.dll", "cublas64_*.dll", "cublasLt64_*.dll")) {
+            $files = Get-ChildItem -Path $cudaBin -Filter $pattern -ErrorAction SilentlyContinue
+            if (-not $files) {
+              throw "CUDA runtime dependency not found: $pattern in $cudaBin"
+            }
+            $files | Copy-Item -Destination $dest -Force
+          }
+
+          Copy-Item LICENSE $dest -Force
+
+          $describe = (git describe --tags --always).Trim()
+          $commit = (git rev-parse HEAD).Trim()
+          @"
+          Source: https://github.com/tookdes/llamAmpere
+          Describe: $describe
+          Commit: $commit
+          Upstream: https://github.com/JakeATX/llamAmpere
+          Platform: Windows x64
+          CUDA toolkit: 12.4
+          CUDA architecture: SM86
+          GGML_NATIVE: OFF
+          "@ | Set-Content -Path (Join-Path $dest "BUILD_INFO.txt") -Encoding ASCII
+
+          Write-Host "Packaged files:"
+          Get-ChildItem $dest | Sort-Object Name | Format-Table Name, Length -AutoSize
+
+      - name: Create ZIP
+        shell: powershell
+        run: |
+          $dest = Join-Path $PWD "build-sm86\bin\Release"
+          7z a -tzip -mx=7 "llamAmpere-main-win-x64-cuda12.4-sm86.zip" "$dest\*"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: llamAmpere-main-win-x64-cuda12.4-sm86
+          path: llamAmpere-main-win-x64-cuda12.4-sm86.zip
+          if-no-files-found: error
+          retention-days: 14
